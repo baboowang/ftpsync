@@ -7,6 +7,42 @@ use Modification::Log;
 use Encode::Locale;
 use Encode;
 use utf8;
+use threads;
+use threads::shared;
+
+my %cache : shared;
+
+my $thr = async {
+    while (1) {
+        my %records;
+        {
+            lock(%cache);
+            %records = %cache;
+            %cache = ();
+        }
+
+        if (scalar(%records)) {
+            my $dbh = Modification::Log->db_Main;
+            $dbh->begin_work;
+            for my $path (keys %records) {
+                my ($action, $last_time) = $records{$path} =~ /^(.)(\d+)$/;
+
+                if ($action eq '+') {
+                    Modification::Log->log($path);
+                    $dbh->do(qq{
+                        insert or ignore into log (id, last_modify_time) values ('$path', $last_time)
+                    });
+                } else {
+                    $dbh->do(qq{
+                        delete from log where id='$path'
+                    });
+                }
+            }
+            $dbh->commit;
+        }
+        sleep 1;
+    }
+};
 
 binmode(STDOUT, ':encoding(locale)');
 
@@ -52,9 +88,18 @@ while(<$fh>) {
 
 sub modify_log {
     my ($type, $path) = @_;
+    my $time = time;
     if ($type eq 'modify' or $type eq 'create') {
-        Modification::Log->log($path);
+        if ($cache{$path} and $cache{$path} =~ /^\+/) {
+            return;
+        }
+        $cache{$path} = '+' . $time;
+        #Modification::Log->log($path);
     } elsif ($type eq 'delete') {
-        Modification::Log->search(id => $path)->delete_all;
+        #print "delete $path\n";
+        $cache{$path} = '-' . $time;
+        #Modification::Log->search(id => $path)->delete_all;
     }
 }
+
+$thr->join;
